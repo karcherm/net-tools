@@ -102,6 +102,7 @@ struct option longopts[] = {
     {"verbose", 	0, 0, 'v'},	/* Report each action taken.  */
     {"version", 	0, 0, 'V'},	/* Emit version information.  */
     {"watch", 		0, 0, 'w'},	/* Constantly monitor the port.  */
+    {"cable-test",	0, 0, 't'},	/* Cable test.  */
     {"help", 		0, 0, '?'},	/* Give help */
     { 0, 0, 0, 0 }
 };
@@ -112,7 +113,8 @@ static unsigned int
     opt_restart = 0,
     opt_reset = 0,
     opt_log = 0,
-    opt_watch = 0;
+    opt_watch = 0,
+    opt_test = 0;
 static int nway_advertise = 0;
 static int fixed_speed = 0;
 static int override_phy = -1;
@@ -415,8 +417,97 @@ static int do_one_xcvr(int skfd, char *ifname, int maybe)
 	    bmcr |= BMCR_FULLDPLX;
 	mdio_write(skfd, MII_BMCR, bmcr);
     }
+    if (opt_test) {
+	// Marvell virtual cable test.
+	// See
+	//   http://www.dexsilicium.com/Marvell_88E1112.pdf
+	//   http://svn.dd-wrt.com/browser/src/linux/xscale/linux-2.6.23/arch/arm/mach-mv88fxx81/Board/QD-DSDT_2.5b/src/msapi/gtVct.c?rev=8934
+	//   http://svn.dd-wrt.com/browser/src/linux/xscale/linux-2.6.23/arch/arm/mach-mv88fxx81/Board/QD-DSDT_2.5b/Include/h/msApi/gtVct.h?rev=8934
+	//   http://svn.dd-wrt.com/browser/src/linux/xscale/linux-2.6.23/arch/arm/mach-mv88fxx81/Board/QD-DSDT_2.5b/src/driver/gtHwCntl.c?rev=8934
+	//   http://svn.dd-wrt.com/browser/src/linux/xscale/linux-2.6.23/arch/arm/mach-mv88fxx81/Board/QD-DSDT_2.5b/src/driver/gtDrvConfig.c?rev=8934
+	int i;
+	unsigned status_reg, page_reg, reg18;
 
-    if (!opt_restart && !opt_reset && !fixed_speed && !nway_advertise)
+	if (mdio_read(skfd, 2) != 0x141 || (mdio_read(skfd, 3) & 0xFC00) != 0xc00)
+	{
+	    puts("Cable test only works with Yukon/Marvell PHYs");
+	    return 0;
+	}
+	reg18 = mdio_read(skfd, 18);
+	// mask all interrupts (e.g. "link loss", expected during test)
+	// The linux driver does not like to get an interrupt if the PHY is
+	// not on the expected page.
+	mdio_write(skfd, 18, 0);
+	// select page 5
+	page_reg = mdio_read(skfd, 22);
+	mdio_write(skfd, 22, 5);
+	mdio_write(skfd, 16, 0x8000);
+	for (i = 0;i < 100; i++)
+	{
+	    status_reg = mdio_read(skfd, 16);
+	    if (status_reg & 0x8000)
+		usleep(100*1000);
+	    else
+		break;
+	}
+	if (!(status_reg & 0x8000))
+	{
+	    // Pair assignment:
+	    // 0 = 1/2
+	    // 1 = 3/6
+	    // 2 = 4/5
+	    // 3 = 7/8
+	    int reg20;
+	    int reg21;
+	    for (i = 0;i < 4; i++)
+	    {
+		static const char* vct_summary[] = {"OK", "short", "open", "test failed"};
+		int pair_reg = mdio_read(skfd, 16+i);
+		printf("Pair %d: %04x\n", i, pair_reg);
+		printf("  Summary: %s\n", vct_summary[(pair_reg >> 13) & 3]);
+		if ((pair_reg & 0xFF) != 0xFF)
+		{
+		    printf("  Reflection amplitude: %d\n", ((pair_reg >> 8) & 0x1F) - 16);
+		    printf("  Reflection distance: ca. %d meters\n", ((pair_reg & 0xFF) * 8018 - 287510) / 10000);
+		}
+		else
+		{
+		    puts("  No reflection");
+		}
+	    }
+	    reg20 = mdio_read(skfd, 20);
+	    reg21 = mdio_read(skfd, 21);
+	    if (reg21 & 0x40)
+	    {
+		for (i = 0;i < 4; i++)
+		{
+		    static const char * vct_polarity[] = {"regular", "inverted"};
+		    printf("Pair %d: polarity: %s\n", i, vct_polarity[(reg21 >> i) & 1]);
+		}
+		if (reg21 & 0x10)
+		{
+		    puts("Crossover on pairs 0/1 (10/100 MBit crosslink)");
+		}
+		if (reg21 & 0x20)
+		{
+		    puts("Crossover on pairs 2/3");
+		}
+		for (i = 0;i < 4; i++)
+		{
+		    printf("Pair %d skew: %d ns\n", i, ((reg20 >> (4*i)) & 0xF) * 8);
+		}
+	    }
+	}
+	else
+	{
+	    puts("Measurement timeout");
+	}
+	// restore page
+	mdio_write(skfd, 22, page_reg);
+	mdio_write(skfd, 18, reg18);
+    }
+
+    if (!opt_restart && !opt_reset && !fixed_speed && !nway_advertise && !opt_test)
 	show_basic_mii(skfd, mii->phy_id);
 
     return 0;
@@ -461,6 +552,7 @@ const char *usage =
 "       -A, --advertise=media,...   advertise only specified media\n"
 "       -F, --force=media           force specified media technology\n"
 "       -p, --phy=addr              set PHY (MII address) to report\n"
+"       -t, --cable-test            test cable using Marvell Gigabit PHY\n"
 "media: 1000baseTx-HD, 1000baseTx-FD,\n"
 "       100baseT4, 100baseTx-FD, 100baseTx-HD,\n"
 "       10baseT-FD, 10baseT-HD,\n"
@@ -479,7 +571,7 @@ int main(int argc, char **argv)
     int i, c, ret, errflag = 0;
     unsigned ctrl1000 = 0;
 
-    while ((c = getopt_long(argc, argv, "A:F:p:lrRvVw?", longopts, 0)) != EOF)
+    while ((c = getopt_long(argc, argv, "A:F:p:lrRvVwt?", longopts, 0)) != EOF)
 	switch (c) {
 	case 'A': nway_advertise = parse_media(optarg, &ctrl1000); break;
 	case 'F': fixed_speed = parse_media(optarg, &ctrl1000); break;
@@ -490,6 +582,7 @@ int main(int argc, char **argv)
 	case 'V': opt_version++;	break;
 	case 'w': opt_watch++;		break;
 	case 'l': opt_log++;		break;
+	case 't': opt_test++;           break;
 	case '?': errflag++;
 	}
     /* Check for a few inappropriate option combinations */
